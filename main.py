@@ -1,24 +1,26 @@
-# main.py
 import requests
 import time
 import json
 import os
 from datetime import datetime
+from bs4 import BeautifulSoup
 
-# 환경 변수에서 설정값 가져오기 (Render에서 설정)
+# 환경 변수
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
-CHECK_INTERVAL = int(os.environ.get('CHECK_INTERVAL', '300'))  # 기본 5분
+CHECK_INTERVAL = int(os.environ.get('CHECK_INTERVAL', '180'))  # 3분
 
 class KoreatechJobNotifier:
     def __init__(self):
         self.seen_posts = set()
+        self.base_url = "https://portal.koreatech.ac.kr"
+        self.board_url = f"{self.base_url}/ctt/bb/bulletin?b=21"
         self.load_seen_posts()
         print(f"✅ 봇 초기화 완료")
         print(f"📱 텔레그램 Chat ID: {TELEGRAM_CHAT_ID}")
+        print(f"🌐 모니터링 URL: {self.board_url}")
     
     def load_seen_posts(self):
-        """이전에 확인한 게시글 ID 불러오기"""
         try:
             with open('seen_posts.json', 'r', encoding='utf-8') as f:
                 self.seen_posts = set(json.load(f))
@@ -28,75 +30,177 @@ class KoreatechJobNotifier:
             self.seen_posts = set()
     
     def save_seen_posts(self):
-        """확인한 게시글 ID 저장"""
         with open('seen_posts.json', 'w', encoding='utf-8') as f:
             json.dump(list(self.seen_posts), f, ensure_ascii=False)
     
     def get_job_posts(self):
-        """학생생활 게시판에서 아르바이트 공고 가져오기"""
+        """학생생활 게시판에서 아르바이트 분류 게시글 가져오기"""
         try:
-            # KOIN API 사용 (실제 엔드포인트는 API 문서 확인 필요)
             headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
             }
             
-            # 방법 1: KOIN API 사용
+            # 1. 먼저 API 시도
+            try:
+                api_url = f"{self.base_url}/api/bulletin/list"
+                response = requests.get(
+                    api_url,
+                    params={'b': '21', 'limit': 30},
+                    headers=headers,
+                    timeout=15
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    print(f"📡 API 응답 성공")
+                    return self.parse_api_response(data)
+            except Exception as e:
+                print(f"⚠️ API 시도 실패: {e}")
+            
+            # 2. API 실패 시 HTML 파싱
+            print(f"🌐 HTML 페이지 파싱 시도...")
             response = requests.get(
-                "https://api.koreatech.in/articles",
-                params={
-                    "board_id": 3,  # 학생생활 게시판 ID (확인 필요)
-                    "limit": 20
-                },
+                self.board_url,
                 headers=headers,
                 timeout=15
             )
             
+            print(f"📡 페이지 응답 상태: {response.status_code}")
+            
             if response.status_code == 200:
-                data = response.json()
-                articles = data.get('articles', [])
-                
-                # '아르바이트' 키워드 필터링
-                job_posts = []
-                keywords = ['아르바이트', '알바', '구인', '구함', '모집']
-                
-                for article in articles:
-                    title = article.get('title', '').lower()
-                    if any(keyword in title for keyword in keywords):
-                        job_posts.append(article)
-                
-                return job_posts
+                return self.parse_html_response(response.text)
             else:
-                print(f"⚠️ API 응답 오류: {response.status_code}")
+                print(f"⚠️ 페이지 로드 실패: {response.status_code}")
                 return []
         
         except Exception as e:
             print(f"❌ 게시글 가져오기 실패: {e}")
+            import traceback
+            traceback.print_exc()
             return []
+    
+    def parse_api_response(self, data):
+        """API 응답 파싱"""
+        job_posts = []
+        articles = data.get('list', data.get('articles', data.get('data', [])))
+        
+        for article in articles:
+            category = article.get('category', article.get('classification', ''))
+            if '아르바이트' in str(category):
+                job_posts.append({
+                    'id': article.get('id', article.get('no', '')),
+                    'title': article.get('title', '제목 없음'),
+                    'author': article.get('author', article.get('writer', '익명')),
+                    'date': article.get('date', article.get('created_at', '')),
+                    'category': category
+                })
+                print(f"  ✓ 발견: [{category}] {article.get('title', '')}")
+        
+        return job_posts
+    
+    def parse_html_response(self, html):
+        """HTML 파싱 (API가 없을 경우)"""
+        job_posts = []
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # 게시글 목록 찾기 (실제 HTML 구조에 맞게 조정 필요)
+        # 일반적인 게시판 구조 패턴들
+        possible_selectors = [
+            'table.board-list tbody tr',
+            'ul.board-list li',
+            'div.board-item',
+            'tr[data-id]',
+            '.bulletin-list tr',
+            '.list-item'
+        ]
+        
+        rows = []
+        for selector in possible_selectors:
+            rows = soup.select(selector)
+            if rows:
+                print(f"✓ 게시글 목록 발견: {selector} ({len(rows)}개)")
+                break
+        
+        if not rows:
+            print("⚠️ 게시글 목록을 찾을 수 없습니다.")
+            print("HTML 구조 분석 필요:")
+            print(html[:500])
+            return []
+        
+        for row in rows:
+            try:
+                # 분류 찾기
+                category_elem = row.select_one('.category, .classification, td:nth-child(1), .type')
+                category = category_elem.text.strip() if category_elem else ''
+                
+                # '아르바이트' 분류만 필터링
+                if '아르바이트' not in category:
+                    continue
+                
+                # 제목
+                title_elem = row.select_one('.title, .subject, td.title, a.title')
+                title = title_elem.text.strip() if title_elem else '제목 없음'
+                
+                # 링크/ID
+                link_elem = row.select_one('a[href]')
+                href = link_elem.get('href', '') if link_elem else ''
+                post_id = href.split('=')[-1] if '=' in href else ''
+                
+                # 작성자
+                author_elem = row.select_one('.author, .writer, td.author')
+                author = author_elem.text.strip() if author_elem else '익명'
+                
+                # 날짜
+                date_elem = row.select_one('.date, .regdate, td.date')
+                date = date_elem.text.strip() if date_elem else ''
+                
+                job_posts.append({
+                    'id': post_id,
+                    'title': title,
+                    'author': author,
+                    'date': date,
+                    'category': category,
+                    'url': f"{self.base_url}{href}" if href and not href.startswith('http') else href
+                })
+                
+                print(f"  ✓ 발견: [{category}] {title}")
+                
+            except Exception as e:
+                print(f"⚠️ 게시글 파싱 오류: {e}")
+                continue
+        
+        return job_posts
     
     def send_telegram_message(self, post):
         """텔레그램으로 알림 전송"""
         title = post.get('title', '제목 없음')
         author = post.get('author', '익명')
-        created_at = post.get('created_at', '')
+        date = post.get('date', '')
+        category = post.get('category', '')
         post_id = post.get('id', '')
+        
+        # URL 생성
+        url = post.get('url', f"{self.board_url}&a={post_id}")
         
         message = f"""🔔 새로운 아르바이트 공고!
 
-📌 {title}
+🏷️ 분류: {category}
+📌 제목: {title}
 👤 작성자: {author}
-📅 {created_at}
+📅 날짜: {date}
 
-🔗 https://koreatech.in/board/{post_id}
+🔗 {url}
 """
         
         try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
             payload = {
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": message,
                 "disable_web_page_preview": True
             }
-            response = requests.post(url, json=payload, timeout=10)
+            response = requests.post(api_url, json=payload, timeout=10)
             response.raise_for_status()
             print(f"✅ 알림 전송 성공: {title[:30]}...")
             return True
@@ -112,31 +216,35 @@ class KoreatechJobNotifier:
         
         for post in posts:
             post_id = str(post.get('id', ''))
-            if post_id and post_id not in self.seen_posts:
+            # ID가 없으면 제목으로 중복 체크
+            identifier = post_id if post_id else post.get('title', '')
+            
+            if identifier and identifier not in self.seen_posts:
                 new_posts.append(post)
-                self.seen_posts.add(post_id)
+                self.seen_posts.add(identifier)
         
-        # 새 게시글이 있으면 알림 전송
+        # 새 게시글 알림
         for post in new_posts:
             self.send_telegram_message(post)
-            time.sleep(2)  # API 요청 제한 방지
+            time.sleep(2)
         
-        # 확인한 게시글 저장
         if new_posts:
             self.save_seen_posts()
         
         return len(new_posts)
     
     def run(self):
-        """메인 루프 - 계속 실행"""
-        print("=" * 50)
+        """메인 루프"""
+        print("=" * 60)
         print("🚀 한국기술교육대학교 아르바이트 알림 봇 시작!")
+        print(f"📋 게시판: 학생생활 (b=21)")
+        print(f"🏷️  필터: 분류='아르바이트'")
         print(f"⏰ 체크 주기: {CHECK_INTERVAL}초 ({CHECK_INTERVAL//60}분)")
-        print("=" * 50)
+        print("=" * 60)
         
         # 시작 알림
         try:
-            start_message = "🤖 아르바이트 알림 봇이 시작되었습니다!\n24시간 자동으로 새 공고를 확인합니다."
+            start_message = "🤖 아르바이트 알림 봇이 시작되었습니다!\n\n📋 학생생활 게시판\n🏷️ 분류: 아르바이트"
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
             requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": start_message}, timeout=10)
         except:
@@ -152,7 +260,7 @@ class KoreatechJobNotifier:
                 if new_count > 0:
                     print(f"✅ 새 게시글 {new_count}개 발견 및 알림 전송!")
                 else:
-                    print("💤 새 게시글 없음")
+                    print("💤 새 아르바이트 공고 없음")
                 
                 print(f"⏰ {CHECK_INTERVAL}초 후 다시 확인...")
                 time.sleep(CHECK_INTERVAL)
@@ -162,11 +270,12 @@ class KoreatechJobNotifier:
                 break
             except Exception as e:
                 print(f"❌ 오류 발생: {e}")
+                import traceback
+                traceback.print_exc()
                 print("⏰ 60초 후 재시도...")
                 time.sleep(60)
 
 if __name__ == "__main__":
-    # 환경 변수 확인
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("❌ 오류: TELEGRAM_BOT_TOKEN과 TELEGRAM_CHAT_ID를 설정해주세요!")
         exit(1)
